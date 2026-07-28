@@ -10,3 +10,4 @@ python/dist/
 __pycache__/
 *.pyc
 report/*.png
+README.md
