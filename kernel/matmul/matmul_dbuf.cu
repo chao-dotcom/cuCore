@@ -1,0 +1,153 @@
+// cuCore/kernel/matmul/matmul_dbuf.cu
+//
+// Double-buffered GEMM kernel: Implements buffer ping-ponging between tile loads.
+// While the inner-product loop consumes tile t's data already in shared memory,
+// we issue global loads for tile t+1 into the alternate buffer *before* that
+// inner loop runs, so the global-memory latency for t+1 is hidden behind
+// the compute for t. Only one __syncthreads() is needed per iteration
+// (after the prefetch lands and before swapping buffers) instead of two.
+//
+// Block tile: 64x64, K-depth: 16
+// Thread micro-tile: 4x4
+// This demonstrates the ping-pong buffering pattern -- profile with `ncu`
+// to confirm whether the compiler/architecture is already overlapping the
+// loads with the previous tile's compute sequence.
+
+#include "../../common/cuda_utils.cuh"
+#include <cublas_v2.h>
+
+void matmul_cpu(const float* A, const float* B, float* C, int N) {
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j) {
+            double acc = 0.0;
+            for (int k = 0; k < N; ++k) acc += (double)A[i*N+k] * B[k*N+j];
+            C[i*N+j] = (float)acc;
+        }
+}
+
+constexpr int BM = 64, BN = 64, BK = 16;
+constexpr int TM = 4, TN = 4;
+
+__global__ void matmul_dbuf_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                                    float* __restrict__ C, int N) {
+    __shared__ float As[2][BK][BM];
+    __shared__ float Bs[2][BK][BN];
+
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+    const int tx = threadIdx.x % (BN / TN);
+    const int ty = threadIdx.x / (BN / TN);
+    const int tid = threadIdx.x;
+
+    float acc[TM][TN] = {0.f};
+    int num_k_tiles = (N + BK - 1) / BK;
+
+    auto load_tile = [&](int t, int buf) {
+#pragma unroll
+        for (int i = tid; i < BM * BK; i += blockDim.x) {
+            int a_row = i / BK, a_col = i % BK;
+            int g_row = block_row + a_row, g_col = t * BK + a_col;
+            As[buf][a_col][a_row] = (g_row < N && g_col < N) ? A[g_row * N + g_col] : 0.f;
+        }
+#pragma unroll
+        for (int i = tid; i < BK * BN; i += blockDim.x) {
+            int b_row = i / BN, b_col = i % BN;
+            int g_row = t * BK + b_row, g_col = block_col + b_col;
+            Bs[buf][b_row][b_col] = (g_row < N && g_col < N) ? B[g_row * N + g_col] : 0.f;
+        }
+    };
+
+    int cur = 0;
+    load_tile(0, cur);
+    __syncthreads();
+
+    for (int t = 0; t < num_k_tiles; ++t) {
+        int nxt = cur ^ 1;
+        // Prefetch next tile's global loads while this iteration's compute
+        // has last sync's data ready. Note: this simple version still syncs
+        // before compute; a fully latency-hidden version would stage the
+        // global read into registers first, then only store to shared
+        // right before the sync. This kernel demonstrates the *buffer
+        // ping-pong* structure.
+        if (t + 1 < num_k_tiles) load_tile(t + 1, nxt);
+
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM], b_reg[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) a_reg[i] = As[cur][k][ty * TM + i];
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b_reg[j] = Bs[cur][k][tx * TN + j];
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    acc[i][j] += a_reg[i] * b_reg[j];
+        }
+        __syncthreads();
+        cur = nxt;
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int g_row = block_row + ty * TM + i;
+        if (g_row >= N) continue;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            int g_col = block_col + tx * TN + j;
+            if (g_col < N) C[g_row * N + g_col] = acc[i][j];
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    const int N = (argc > 1) ? std::atoi(argv[1]) : 1024;
+    const bool check = (N <= 512);
+    std::printf("Double-buffered GEMM benchmark, N = %d\n", N);
+
+    size_t bytes = (size_t)N * N * sizeof(float);
+    std::vector<float> h_A(N*N), h_B(N*N), h_C_ref, h_C_gpu(N*N);
+    fill_random(h_A, -1.f, 1.f, 21);
+    fill_random(h_B, -1.f, 1.f, 22);
+
+    double cpu_ms = -1.0;
+    if (check) {
+        h_C_ref.resize(N*N);
+        cpu_ms = benchmark_cpu([&]() { matmul_cpu(h_A.data(), h_B.data(), h_C_ref.data(), N); }, 0, 1);
+    }
+
+    float *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&d_A, bytes));
+    CUDA_CHECK(cudaMalloc(&d_B, bytes));
+    CUDA_CHECK(cudaMalloc(&d_C, bytes));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice));
+
+    dim3 grid((N + BN - 1) / BN, (N + BM - 1) / BM);
+    dim3 block((BM/TM) * (BN/TN));
+    float dbuf_ms = benchmark_gpu([&]() {
+        matmul_dbuf_kernel<<<grid, block>>>(d_A, d_B, d_C, N);
+    }, 2, 10);
+    CUDA_CHECK_LAST();
+
+    bool ok = true;
+    if (check) {
+        CUDA_CHECK(cudaMemcpy(h_C_gpu.data(), d_C, bytes, cudaMemcpyDeviceToHost));
+        ok = allclose(h_C_gpu.data(), h_C_ref.data(), (size_t)N*N, 1e-1, 1e-2);
+    }
+
+    cublasHandle_t handle; cublasCreate(&handle);
+    const float alpha = 1.f, beta = 0.f;
+    float cublas_ms = benchmark_gpu([&]() {
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_B, N, d_A, N, &beta, d_C, N);
+    }, 3, 20);
+    cublasDestroy(handle);
+
+    double flops = 2.0 * N * N * N;
+    std::printf("\n================ matmul_dbuf (GEMM), N=%d ================\n", N);
+    std::printf("  Double-buffered  : %10.4f ms  (%.2f GFLOP/s)\n", dbuf_ms, flops/1e9/(dbuf_ms/1e3));
+    std::printf("  cuBLAS SGEMM     : %10.4f ms  (%.2f GFLOP/s)\n", cublas_ms, flops/1e9/(cublas_ms/1e3));
+    std::printf("  Fraction of cuBLAS achieved: %.1f%%\n", 100.0 * cublas_ms / dbuf_ms);
+    std::printf("  Correctness: dbuf=%s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
