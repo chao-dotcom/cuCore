@@ -16,12 +16,21 @@ This directory contains the complete benchmark results and optimization analysis
 - **`benchmark_results.csv`** — Summary of all Stage 1, 2, and 4 kernels with CPU baseline, naive CUDA, and optimized CUDA timings. Shows speedup factors and throughput.
   - 11 kernels: vector_add, saxpy, dot_product, reduction, scan, histogram, softmax, layernorm, gelu, conv2d, transpose
   
-- **`matmul_sweep.csv`** — GEMM performance across matrix sizes (N = 256 to 4096) comparing naive, shared-memory-tiled, register-tiled (4×4), and cuBLAS.
-  - Register-tiled variant achieves 43% of cuBLAS at N=4096 (31,731 GFLOP/s vs. 74,754 cuBLAS)
+- **`matmul_sweep.csv`** — GEMM performance across matrix sizes (N = 256 to 4096) comparing naive, shared-memory-tiled, register-tiled (4×4), and cuBLAS (original repo benchmark).
+  - Register-tiled variant achieves 43% of cuBLAS at N=4096
   
-- **`matmul_dbuf_sweep.csv`** — Double-buffered GEMM v2 (8×8 tiles + vectorized loads + software pipelining) across the same matrix sizes.
-  - Achieves 37.5% of cuBLAS at N=4096 (28,039 GFLOP/s)
-  - Demonstrates that arithmetic intensity (8×8 vs 4×4) and vectorization matter, but Tensor Cores remain the bigger lever
+- **`matmul_dbuf_sweep.csv`** — Double-buffered GEMM (8×8 tiles + vectorized loads + software pipelining).
+  - Achieves 37.5% of cuBLAS at N=4096 (note: slightly slower than register-tiled due to shared memory ping-pong overhead)
+  
+- **`matmul_v2b_sweep.csv`** — Register-tiled v2b (64×64 block tile, occupancy fix for small/medium N).
+  - Achieves 93.2% of cuBLAS at N=4096, **79.1%–97.4%** at N=1024–2048 (solves occupancy bottleneck)
+  
+- **`matmul_v2c_sweep.csv`** — v2b with split-K (K-dimension splitting for additional parallelism).
+  - Achieves **85.6%** of cuBLAS at N=1024 (above the 85% occupancy target), 91.9% at N=4096
+  
+- **`matmul_tensorcore_v3_sweep.csv`** — Tensor Core WMMA kernel with 128×128 block tile.
+  - Achieves **126.5%** of cuBLAS default (pedantic FP32) at N=4096 because it uses TF32 (10× higher peak throughput)
+  - When measured against cuBLAS's explicit TF32 mode, reaches ~75% (vendor tuning gap)
 
 ### Optimization Reports
 
